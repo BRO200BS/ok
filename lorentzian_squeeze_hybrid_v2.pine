@@ -1,0 +1,393 @@
+//@version=6
+// Lorentzian × Squeeze Momentum Hybrid  —  v2 (hardened)
+// ─────────────────────────────────────────────────────────────────────────────
+// Attribution: Squeeze Momentum (LazyBear), Lorentzian Classification (jdehorty, MPL-2.0)
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// at https://mozilla.org/MPL/2.0/
+//
+// What changed vs v1
+//   • Realistic fills: next-bar-open execution, slippage, explicit margin/pyramiding,
+//     brackets anchored to the REAL fill price (not the signal close).
+//   • k-NN: circular buffer (no array.shift), top-k insertion (no sort), stable stride
+//     phase, 1500-bar default memory, triple-barrier labels (ATR barriers + timeout),
+//     drift-adjusted vote, squeeze-aware features, selectable distance metric.
+//   • Signal: release WINDOW + minimum squeeze duration, one trade per release,
+//     slope-aware trend filter, optional ADX/cost filters (off by default).
+//   • Risk: stop from squeeze structure (clamped by ATR), risk-% position sizing with
+//     leverage cap, partial at 1R, breakeven, chandelier trail, time stop, momentum
+//     fade exit, session/EOD flat, daily-loss and max-drawdown circuit breakers.
+//   • Validation: ablation mode (Lorentzian / Momentum-only / RANDOM direction),
+//     signal-funnel + information-coefficient table.
+//   • Alerts via alert_message JSON (alertcondition() does not work in strategies).
+//
+// NOTE: Commission / slippage / margin live in the strategy() declaration below.
+//       Set them to match your broker, then re-check the Properties tab.
+
+strategy("Lorentzian × Squeeze Hybrid v2", shorttitle="LSQ v2", overlay=false,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=5,
+     commission_type=strategy.commission.percent, commission_value=0.05,
+     slippage=2, pyramiding=0, margin_long=100, margin_short=100,
+     process_orders_on_close=false, calc_on_every_tick=false,
+     max_bars_back=100)
+
+// ═══════════════════════════════ INPUTS ═══════════════════════════════
+string G_GEN = "General"
+string G_SQZ = "Squeeze Momentum"
+string G_LOR = "Lorentzian k-NN"
+string G_FLT = "Filters"
+string G_RSK = "Risk & Exits"
+string G_SES = "Session & Circuit Breakers"
+string G_DBG = "Diagnostics"
+
+startTime   = input.time(timestamp(2018, 1, 1, 0, 0), "Backtest start", group=G_GEN, tooltip="Bars before this date are ignored for trading (indicator warm-up).")
+allowLong   = input.bool(true,  "Allow longs",  group=G_GEN)
+allowShort  = input.bool(true,  "Allow shorts", group=G_GEN)
+reverseOpp  = input.bool(false, "Reverse on opposite signal", group=G_GEN)
+dirMode     = input.string("Lorentzian", "Direction source", options=["Lorentzian", "Momentum Only", "Random"], group=G_GEN, tooltip="Ablation: 'Random' keeps the same entry timing and stops but picks direction pseudo-randomly. If Lorentzian cannot beat it, the compass adds no edge.")
+trendMode   = input.string("EMA200 + Slope", "Trend filter", options=["EMA200 + Slope", "EMA200", "Off"], group=G_GEN)
+emaLen      = input.int(200, "Trend EMA length", minval=2, group=G_GEN)
+
+bbLength     = input.int(20, "BB length", minval=2, group=G_SQZ)
+bbMult       = input.float(2.0, "BB multiplier", minval=0.1, step=0.1, group=G_SQZ)
+kcLength     = input.int(20, "KC length", minval=2, group=G_SQZ)
+kcMult       = input.float(1.5, "KC multiplier", minval=0.1, step=0.1, group=G_SQZ)
+useTrueRange = input.bool(true, "Use True Range (KC)", group=G_SQZ)
+minSqzBars   = input.int(5, "Min squeeze duration (bars)", minval=1, group=G_SQZ, tooltip="Ignore squeezes shorter than this (flicker).")
+releaseWin   = input.int(2, "Release window (bars)", minval=0, maxval=10, group=G_SQZ, tooltip="Signals may confirm up to N bars after the release bar.")
+
+kNeighbors  = input.int(8, "Neighbors (k)", minval=1, maxval=50, group=G_LOR)
+lookback    = input.int(1500, "Memory (bars)", minval=200, maxval=5000, group=G_LOR, tooltip="Larger = more candidates but slower. Loop cost ≈ memory / stride per bar.")
+stride      = input.int(4, "Sampling stride", minval=1, maxval=20, group=G_LOR, tooltip="Candidates are rows whose ABSOLUTE bar index is a multiple of stride (stable pool).")
+horizon     = input.int(12, "Label horizon (bars)", minval=2, maxval=50, group=G_LOR)
+barrierAtr  = input.float(1.5, "Label barrier (× ATR)", minval=0.2, step=0.1, group=G_LOR, tooltip="Triple-barrier: +1 if upper barrier hit first, -1 if lower first, 0 on timeout/ambiguous.")
+normLen     = input.int(500, "Percentile-rank window", minval=50, maxval=2000, group=G_LOR)
+distMode    = input.string("Lorentzian", "Distance metric", options=["Lorentzian", "Manhattan", "Euclidean"], group=G_LOR)
+minVotePct  = input.float(50.0, "Min net vote (% of k)", minval=1, maxval=100, group=G_LOR)
+balanceDrift = input.bool(true, "Subtract window label drift", group=G_LOR, tooltip="Removes the base-rate bias (e.g. uptrend → mostly +1 labels).")
+
+useAdxFilter = input.bool(false, "ADX filter", group=G_FLT)
+adxMin       = input.float(20.0, "ADX minimum", minval=1, group=G_FLT)
+useCostFilter = input.bool(true, "Cost filter (stop must dwarf costs)", group=G_FLT)
+estCostPct   = input.float(0.15, "Est. round-trip cost %", minval=0, step=0.01, group=G_FLT)
+costMult     = input.float(3.0, "Min stop = cost ×", minval=1, step=0.5, group=G_FLT)
+
+atrLen      = input.int(20, "ATR length", minval=2, group=G_RSK)
+structLen   = input.int(10, "Stop structure lookback", minval=2, group=G_RSK, tooltip="Long stop starts at the lowest low of N bars (short: highest high), then is clamped by the ATR bounds.")
+stopMinAtr  = input.float(1.5, "Min stop (× ATR)", minval=0.2, step=0.1, group=G_RSK)
+stopMaxAtr  = input.float(3.0, "Max stop (× ATR)", minval=0.2, step=0.1, group=G_RSK)
+rrRatio     = input.float(2.5, "Final target (R multiple)", minval=0.5, step=0.1, group=G_RSK)
+riskPct     = input.float(1.0, "Risk per trade (% equity)", minval=0.05, step=0.05, group=G_RSK)
+maxLev      = input.float(2.0, "Max leverage (notional / equity)", minval=0.1, step=0.1, group=G_RSK)
+usePartial  = input.bool(true, "Partial profit", group=G_RSK)
+partialPct  = input.float(50.0, "Partial size %", minval=5, maxval=95, group=G_RSK)
+partialR    = input.float(1.0, "Partial at (R)", minval=0.2, step=0.1, group=G_RSK)
+useBE       = input.bool(true, "Move stop to breakeven", group=G_RSK)
+beR         = input.float(1.0, "Breakeven at (R)", minval=0.2, step=0.1, group=G_RSK)
+useTrail    = input.bool(true, "Chandelier trail (after BE)", group=G_RSK)
+chandLen    = input.int(22, "Chandelier lookback", minval=2, group=G_RSK)
+chandMult   = input.float(3.0, "Chandelier (× ATR)", minval=0.5, step=0.1, group=G_RSK)
+maxBarsHold = input.int(24, "Time stop (bars, 0 = off)", minval=0, group=G_RSK)
+useMomExit  = input.bool(false, "Exit on 2-bar momentum fade", group=G_RSK)
+
+useSession  = input.bool(false, "Restrict to session", group=G_SES)
+sessionStr  = input.session("0930-1555", "Session", group=G_SES)
+eodFlat     = input.bool(true, "Flatten when session ends", group=G_SES)
+useDailyLoss = input.bool(true, "Daily loss limit", group=G_SES)
+dailyLossPct = input.float(3.0, "Daily loss limit % equity", minval=0.1, step=0.1, group=G_SES)
+useMaxDD    = input.bool(false, "Max drawdown halt", group=G_SES)
+maxDDPct    = input.float(30.0, "Max drawdown % (halts strategy)", minval=1, step=1, group=G_SES)
+
+showTable   = input.bool(true, "Show diagnostics table", group=G_DBG)
+
+// Alert payloads (strategy alerts: create alert → "Order fills only")
+const string AL_LONG  = '{"action":"buy","ticker":"{{ticker}}","price":"{{close}}","comment":"LSQ long"}'
+const string AL_SHORT = '{"action":"sell","ticker":"{{ticker}}","price":"{{close}}","comment":"LSQ short"}'
+const string AL_EXIT  = '{"action":"exit","ticker":"{{ticker}}","price":"{{close}}","comment":"LSQ exit"}'
+
+// ═════════════ LAYER 1 — SQUEEZE MOMENTUM ═════════════
+bbBasis = ta.sma(close, bbLength)
+bbDev   = bbMult * ta.stdev(close, bbLength)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+kcBasis = ta.sma(close, kcLength)
+kcRange = ta.sma(useTrueRange ? ta.tr : high - low, kcLength)
+kcUpper = kcBasis + kcMult * kcRange
+kcLower = kcBasis - kcMult * kcRange
+
+sqzOn  = bbLower > kcLower and bbUpper < kcUpper
+sqzOff = bbLower < kcLower and bbUpper > kcUpper
+noSqz  = not sqzOn and not sqzOff
+
+squeezeFired = sqzOn[1] and not sqzOn
+
+var int sqzCount   = 0
+var int lastSqzLen = 0
+var int relSqzLen  = 0
+sqzCount := sqzOn ? sqzCount + 1 : 0
+if sqzOn
+    lastSqzLen := sqzCount
+if squeezeFired
+    relSqzLen := sqzCount[1]
+
+barsSinceRel = ta.barssince(squeezeFired)
+inWindow = not na(barsSinceRel) and barsSinceRel <= releaseWin and relSqzLen >= minSqzBars
+
+momSrc = close - math.avg(math.avg(ta.highest(high, kcLength), ta.lowest(low, kcLength)), ta.sma(close, kcLength))
+val    = ta.linreg(momSrc, kcLength, 0)
+momPos  = val > 0
+momNeg  = val < 0
+momUp   = val > val[1]
+momDown = val < val[1]
+
+// ═════════════ SHARED SERIES ═════════════
+ema200 = ta.ema(close, emaLen)
+atrS   = ta.atr(atrLen)
+[_, _, adxVal] = ta.dmi(14, 14)
+
+// ═════════════ LAYER 2 — LORENTZIAN k-NN ═════════════
+// Six features, all scaled to [0,1]. Squeeze-aware; redundant oscillators removed.
+float f1 = ta.rsi(close, 14) / 100
+float f2 = ta.percentrank(val / atrS, normLen) / 100                     // momentum / volatility
+float f3 = ta.percentrank((bbUpper - bbLower) / bbBasis, normLen) / 100  // BB width percentile
+float f4 = math.min(lastSqzLen, 30) / 30.0                               // squeeze duration
+float f5 = ta.percentrank(adxVal, normLen) / 100                         // trend strength
+float f6 = ta.percentrank((close - ema200) / atrS, normLen) / 100        // distance to trend
+const int NF = 6
+array<float> cur = array.from(f1, f2, f3, f4, f5, f6)
+
+int N = lookback + horizon + 10                      // circular buffer length
+var matrix<float> feat   = matrix.new<float>(N, NF, na)
+var array<float>  labels = array.new<float>(N, na)
+var array<float>  knnD   = array.new<float>(kNeighbors, 1e10)
+var array<float>  knnY   = array.new<float>(kNeighbors, 0.0)
+
+f_dist(array<float> a, matrix<float> m, int row, string mode) =>
+    float s = 0.0
+    for c = 0 to NF - 1
+        float d = math.abs(array.get(a, c) - matrix.get(m, row, c))   // na propagates → row skipped
+        s += mode == "Lorentzian" ? math.log(1 + d) : mode == "Manhattan" ? d : d * d
+    s
+
+// 1) write this bar's features into its slot (label unknown yet)
+int slot = bar_index % N
+for c = 0 to NF - 1
+    matrix.set(feat, slot, c, array.get(cur, c))
+array.set(labels, slot, na)
+
+// 2) triple-barrier label for the row `horizon` bars ago (all of its future bars are now closed)
+if bar_index >= horizon
+    float e0 = close[horizon]
+    float a0 = atrS[horizon]
+    float lab = na
+    if not na(e0) and not na(a0)
+        float upB = e0 + barrierAtr * a0
+        float dnB = e0 - barrierAtr * a0
+        lab := 0.0
+        for j = horizon - 1 to 0
+            bool hitU = high[j] >= upB
+            bool hitD = low[j] <= dnB
+            if hitU and hitD
+                lab := 0.0
+                break
+            else if hitU
+                lab := 1.0
+                break
+            else if hitD
+                lab := -1.0
+                break
+    array.set(labels, (bar_index - horizon) % N, lab)
+
+// 3) k-NN search over stable stride-aligned rows, keeping the k best via insertion
+float prediction = na
+int poolN = 0
+if bar_index > horizon + 1
+    array.fill(knnD, 1e10)
+    array.fill(knnY, 0.0)
+    int s0   = bar_index - horizon
+    int sTop = s0 - s0 % stride
+    int sMin = math.max(0, bar_index - lookback)
+    int nCand = sTop >= sMin ? math.floor((sTop - sMin) / stride) + 1 : 0
+    float lblSum = 0.0
+    for q = 0 to nCand - 1
+        int r = (sTop - q * stride) % N
+        float y = array.get(labels, r)
+        if not na(y)
+            float d = f_dist(cur, feat, r, distMode)
+            if not na(d)
+                poolN += 1
+                lblSum += y
+                float worst = array.max(knnD)
+                if d < worst
+                    int wi = array.indexof(knnD, worst)
+                    array.set(knnD, wi, d)
+                    array.set(knnY, wi, y)
+    if poolN >= kNeighbors * 4
+        prediction := array.sum(knnY) - (balanceDrift ? kNeighbors * lblSum / poolN : 0.0)
+
+float voteThr = kNeighbors * minVotePct / 100
+bool lorLong  = not na(prediction) and prediction >=  voteThr
+bool lorShort = not na(prediction) and prediction <= -voteThr
+
+// ═════════════ LAYERS 3–4 — GATE, REGIME, FILTERS ═════════════
+bool trendLong  = trendMode == "Off" or (close > ema200 and (trendMode == "EMA200" or ema200 > ema200[10]))
+bool trendShort = trendMode == "Off" or (close < ema200 and (trendMode == "EMA200" or ema200 < ema200[10]))
+
+float rnd = math.sin(bar_index * 12.9898) * 43758.5453
+bool randLong = rnd - math.floor(rnd) > 0.5
+
+bool dirLong = switch dirMode
+    "Lorentzian"    => lorLong and momPos and momUp and trendLong
+    "Momentum Only" => momPos and momUp and trendLong
+    => randLong
+bool dirShort = switch dirMode
+    "Lorentzian"    => lorShort and momNeg and momDown and trendShort
+    "Momentum Only" => momNeg and momDown and trendShort
+    => not randLong
+
+// ═════════════ LAYER 5 — STOP, SIZING, ENTRIES ═════════════
+float structL = close - ta.lowest(low, structLen)
+float structS = ta.highest(high, structLen) - close
+float longStopD  = math.min(math.max(structL, stopMinAtr * atrS), stopMaxAtr * atrS)
+float shortStopD = math.min(math.max(structS, stopMinAtr * atrS), stopMaxAtr * atrS)
+
+float chandL = ta.highest(high, chandLen) - chandMult * atrS
+float chandS = ta.lowest(low, chandLen) + chandMult * atrS
+
+bool inDate = time >= startTime
+bool inSess = not useSession or not na(time(timeframe.period, sessionStr))
+
+var bool usedRelease = false
+if squeezeFired
+    usedRelease := false
+
+bool baseOk = inDate and inSess and inWindow and not usedRelease and (not useAdxFilter or adxVal > adxMin)
+bool costOkL = not useCostFilter or longStopD / close * 100 >= estCostPct * costMult
+bool costOkS = not useCostFilter or shortStopD / close * 100 >= estCostPct * costMult
+
+bool longSignal  = baseOk and dirLong  and allowLong  and costOkL and not na(longStopD)
+bool shortSignal = baseOk and dirShort and allowShort and costOkS and not na(shortStopD)
+
+f_qty(float stopD) =>
+    float q = strategy.equity * riskPct / 100 / (stopD * syminfo.pointvalue)
+    q := math.min(q, strategy.equity * maxLev / (close * syminfo.pointvalue))
+    q := math.floor(q / syminfo.mincontract) * syminfo.mincontract
+    q
+
+// Circuit breakers
+if useDailyLoss
+    strategy.risk.max_intraday_loss(dailyLossPct, strategy.percent_of_equity)
+if useMaxDD
+    strategy.risk.max_drawdown(maxDDPct, strategy.percent_of_equity)
+
+var float pendStop = na   // stop distance of the order currently being sent
+var float stopDist = na   // stop distance of the open trade
+var float stopPx   = na
+var float tpPx     = na
+var int   barsInTrade = 0
+var bool  partialDone = false
+var bool  beDone      = false
+var int nFired = 0, nWindow = 0, nBase = 0, nDir = 0, nSent = 0, nSkipQty = 0
+
+nFired  += squeezeFired ? 1 : 0
+nWindow += inWindow and not inWindow[1] ? 1 : 0
+nBase   += baseOk and (not na(prediction) or dirMode != "Lorentzian") and not baseOk[1] ? 1 : 0
+nDir    += (longSignal or shortSignal) ? 1 : 0
+
+bool posFlat = strategy.position_size == 0
+bool canLong  = longSignal  and (posFlat or (reverseOpp and strategy.position_size < 0))
+bool canShort = shortSignal and (posFlat or (reverseOpp and strategy.position_size > 0))
+
+if canLong
+    float q = f_qty(longStopD)
+    if q > 0
+        pendStop := longStopD
+        strategy.entry("Long", strategy.long, qty=q, alert_message=AL_LONG)
+        float tk = longStopD / syminfo.mintick
+        strategy.exit("Long X", from_entry="Long", loss=tk, profit=tk * rrRatio, alert_message=AL_EXIT)
+        usedRelease := true
+        nSent += 1
+    else
+        nSkipQty += 1
+
+if canShort
+    float q = f_qty(shortStopD)
+    if q > 0
+        pendStop := shortStopD
+        strategy.entry("Short", strategy.short, qty=q, alert_message=AL_SHORT)
+        float tk = shortStopD / syminfo.mintick
+        strategy.exit("Short X", from_entry="Short", loss=tk, profit=tk * rrRatio, alert_message=AL_EXIT)
+        usedRelease := true
+        nSent += 1
+    else
+        nSkipQty += 1
+
+// ═════════════ TRADE MANAGEMENT (anchored to the real fill) ═════════════
+bool inPos  = strategy.position_size != 0
+bool isLong = strategy.position_size > 0
+string idE  = isLong ? "Long" : "Short"
+float avgPx = strategy.position_avg_price
+
+bool newTrade = strategy.opentrades > 0 and strategy.opentrades.entry_bar_index(strategy.opentrades - 1) == bar_index
+if newTrade
+    stopDist := pendStop
+    stopPx := math.round_to_mintick(isLong ? avgPx - stopDist : avgPx + stopDist)
+    tpPx   := math.round_to_mintick(isLong ? avgPx + stopDist * rrRatio : avgPx - stopDist * rrRatio)
+    barsInTrade := 0
+    partialDone := false
+    beDone := false
+else if inPos
+    barsInTrade += 1
+
+if inPos and not na(stopDist)
+    float fav = isLong ? high - avgPx : avgPx - low
+    if useBE and not beDone and fav >= beR * stopDist
+        beDone := true
+        stopPx := isLong ? math.max(stopPx, avgPx) : math.min(stopPx, avgPx)
+    if useTrail and beDone and not na(chandL) and not na(chandS)
+        stopPx := math.round_to_mintick(isLong ? math.max(stopPx, chandL) : math.min(stopPx, chandS))
+    if usePartial and not partialDone and fav >= partialR * stopDist
+        partialDone := true
+        strategy.close(idE, qty_percent=partialPct, comment="Partial")
+    strategy.exit(idE + " X", from_entry=idE, stop=stopPx, limit=tpPx, alert_message=AL_EXIT)
+
+    if maxBarsHold > 0 and barsInTrade >= maxBarsHold
+        strategy.close(idE, comment="Time stop", alert_message=AL_EXIT)
+    if useMomExit and ((isLong and val < val[1] and val[1] < val[2]) or (not isLong and val > val[1] and val[1] > val[2]))
+        strategy.close(idE, comment="Momentum fade", alert_message=AL_EXIT)
+
+if useSession and eodFlat and not inSess and inPos
+    strategy.close_all(comment="Session end", immediately=true)
+
+// ═════════════ DIAGNOSTICS ═════════════
+float fwdRet = close / close[horizon] - 1
+float ic = ta.correlation(nz(prediction[horizon]), fwdRet, 500)
+
+var table tbl = table.new(position.top_right, 2, 9, border_width=1)
+if showTable and barstate.islast
+    f_row(int r, string k, string v) =>
+        table.cell(tbl, 0, r, k, text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
+        table.cell(tbl, 1, r, v, text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
+    f_row(0, "Mode", dirMode)
+    f_row(1, "Squeeze releases", str.tostring(nFired))
+    f_row(2, "Valid windows opened", str.tostring(nWindow))
+    f_row(3, "Pass base filters", str.tostring(nBase))
+    f_row(4, "Direction agrees", str.tostring(nDir))
+    f_row(5, "Orders sent", str.tostring(nSent))
+    f_row(6, "Skipped (qty = 0)", str.tostring(nSkipQty))
+    f_row(7, "k-NN pool size", str.tostring(poolN))
+    f_row(8, "IC (pred vs fwd ret)", na(ic) ? "n/a" : str.tostring(ic, "#.###"))
+
+// ═════════════ PLOTS ═════════════
+plot(ema200, "Trend EMA", color=color.new(color.gray, 20), linewidth=2, force_overlay=true)
+plot(inPos ? stopPx : na, "Stop", color=color.red, style=plot.style_linebr, force_overlay=true)
+plot(inPos ? tpPx : na, "Target", color=color.teal, style=plot.style_linebr, force_overlay=true)
+plotshape(longSignal, "Long signal", shape.triangleup, location.belowbar, color.teal, size=size.small, force_overlay=true)
+plotshape(shortSignal, "Short signal", shape.triangledown, location.abovebar, color.red, size=size.small, force_overlay=true)
+
+plot(val, "Momentum", style=plot.style_histogram, linewidth=3,
+     color=val > 0 ? (momUp ? color.lime : color.green) : (momDown ? color.maroon : color.red))
+plot(0, "Squeeze state", style=plot.style_cross, linewidth=2,
+     color=sqzOn ? color.new(color.orange, 0) : noSqz ? color.new(color.blue, 0) : color.new(color.gray, 0))
+plot(prediction, "k-NN net vote", color=color.new(color.purple, 40), display=display.data_window)
