@@ -1,11 +1,17 @@
 //@version=6
-// Lorentzian × Squeeze Momentum Hybrid  —  v2.1 (Final Compile-Ready)
+// Lorentzian × Squeeze Momentum Hybrid  —  v2.2 (Compile-Fixed)
 // ─────────────────────────────────────────────────────────────────────────────
 // Attribution: Squeeze Momentum (LazyBear), Lorentzian Classification (jdehorty, MPL-2.0)
 // This source code is subject to the terms of the Mozilla Public License 2.0
 // at https://mozilla.org/MPL/2.0/
+//
+// v2.2 fixes:
+//  1) input.time() default must be a const literal -> replaced timestamp(...) with epoch ms literal.
+//  2) Local function f_row() was declared inside an `if` block (illegal) -> moved to global scope.
+//  3) Comma-separated multi-variable `var` declaration split into separate lines.
+//  4) Group strings explicitly typed `const string`.
 
-strategy("Lorentzian × Squeeze Hybrid v2.1", shorttitle="LSQ v2.1", overlay=false,
+strategy("Lorentzian × Squeeze Hybrid v2.2", shorttitle="LSQ v2.2", overlay=false,
      initial_capital=10000, currency=currency.USD,
      default_qty_type=strategy.percent_of_equity, default_qty_value=5,
      commission_type=strategy.commission.percent, commission_value=0.05,
@@ -14,15 +20,16 @@ strategy("Lorentzian × Squeeze Hybrid v2.1", shorttitle="LSQ v2.1", overlay=fal
      use_bar_magnifier=true, max_bars_back=5000)
 
 // ═══════════════════════════════ INPUTS ═══════════════════════════════
-string G_GEN = "General"
-string G_SQZ = "Squeeze Momentum"
-string G_LOR = "Lorentzian k-NN"
-string G_FLT = "Filters"
-string G_RSK = "Risk & Exits"
-string G_SES = "Session & Circuit Breakers"
-string G_DBG = "Diagnostics"
+const string G_GEN = "General"
+const string G_SQZ = "Squeeze Momentum"
+const string G_LOR = "Lorentzian k-NN"
+const string G_FLT = "Filters"
+const string G_RSK = "Risk & Exits"
+const string G_SES = "Session & Circuit Breakers"
+const string G_DBG = "Diagnostics"
 
-startTime   = input.time(timestamp(2018, 1, 1, 0, 0), "Backtest start", group=G_GEN, tooltip="Bars before this date are ignored for trading (indicator warm-up).")
+// 1514764800000 = 2018-01-01 00:00:00 UTC (const literal required by input.time)
+startTime   = input.time(1514764800000, "Backtest start", group=G_GEN, tooltip="Bars before this date are ignored for trading (indicator warm-up).")
 allowLong   = input.bool(true,  "Allow longs",  group=G_GEN)
 allowShort  = input.bool(true,  "Allow shorts", group=G_GEN)
 reverseOpp  = input.bool(false, "Reverse on opposite signal", group=G_GEN)
@@ -130,15 +137,15 @@ atrS   = ta.atr(atrLen)
 
 // ═════════════ LAYER 2 — LORENTZIAN k-NN ═════════════
 float f1 = ta.rsi(close, 14) / 100
-float f2 = ta.percentrank(val / atrS, normLen) / 100                     
-float f3 = ta.percentrank((bbUpper - bbLower) / bbBasis, normLen) / 100  
-float f4 = math.min(lastSqzLen, 30) / 30.0                               
-float f5 = ta.percentrank(adxVal, normLen) / 100                         
-float f6 = ta.percentrank((close - ema200) / atrS, normLen) / 100        
+float f2 = ta.percentrank(val / atrS, normLen) / 100
+float f3 = ta.percentrank((bbUpper - bbLower) / bbBasis, normLen) / 100
+float f4 = math.min(lastSqzLen, 30) / 30.0
+float f5 = ta.percentrank(adxVal, normLen) / 100
+float f6 = ta.percentrank((close - ema200) / atrS, normLen) / 100
 const int NF = 6
 array<float> cur = array.from(f1, f2, f3, f4, f5, f6)
 
-int N = lookback + horizon + 10                      
+int N = lookback + horizon + 10
 var matrix<float> feat   = matrix.new<float>(N, NF, na)
 var array<float>  labels = array.new<float>(N, na)
 var array<float>  knnD   = array.new<float>(kNeighbors, 1e10)
@@ -147,7 +154,7 @@ var array<float>  knnY   = array.new<float>(kNeighbors, 0.0)
 f_dist(array<float> a, matrix<float> m, int row, string mode) =>
     float s = 0.0
     for c = 0 to NF - 1
-        float d = math.abs(array.get(a, c) - matrix.get(m, row, c))   
+        float d = math.abs(array.get(a, c) - matrix.get(m, row, c))
         s += mode == "Lorentzian" ? math.log(1 + d) : mode == "Manhattan" ? d : d * d
     s
 
@@ -283,18 +290,23 @@ f_qty(float stopD) =>
     q := math.floor(q / syminfo.mincontract) * syminfo.mincontract
     q
 
-var float pendStop = na   
-var float stopDist = na   
+var float pendStop = na
+var float stopDist = na
 var float stopPx   = na
 var float tpPx     = na
 var int   barsInTrade = 0
 var bool  partialDone = false
 var bool  beDone      = false
-var int nFired = 0, nWindow = 0, nBase = 0, nDir = 0, nSent = 0, nSkipQty = 0
+var int nFired   = 0
+var int nWindow  = 0
+var int nBase    = 0
+var int nDir     = 0
+var int nSent    = 0
+var int nSkipQty = 0
 
 nFired  += squeezeFired ? 1 : 0
-nWindow += inWindow and not inWindow[1] ? 1 : 0
-nBase   += baseOk and (not na(prediction) or dirMode != "Lorentzian") and not baseOk[1] ? 1 : 0
+nWindow += (inWindow and not inWindow[1]) ? 1 : 0
+nBase   += (baseOk and (not na(prediction) or dirMode != "Lorentzian") and not baseOk[1]) ? 1 : 0
 nDir    += (longSignal or shortSignal) ? 1 : 0
 
 bool posFlat = strategy.position_size == 0
@@ -348,7 +360,7 @@ if inPos and not na(stopDist)
     if usePartial and not partialDone and fav >= partialR * stopDist
         partialDone := true
         strategy.close(idE, qty_percent=partialPct, comment="Partial")
-    
+
     strategy.exit(idE + " X", from_entry=idE, stop=stopPx, limit=tpPx, alert_message=AL_EXIT)
 
     if maxBarsHold > 0 and barsInTrade >= maxBarsHold
@@ -364,10 +376,13 @@ float fwdRet = close / close[horizon] - 1
 float ic = ta.correlation(prediction[horizon], fwdRet, 500)
 
 var table tbl = table.new(position.top_right, 2, 9, border_width=1)
+
+// Must live at global scope (functions cannot be declared inside `if` blocks)
+f_row(int rowIdx, string k, string v) =>
+    table.cell(tbl, 0, rowIdx, k, text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
+    table.cell(tbl, 1, rowIdx, v, text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
+
 if showTable and barstate.islast
-    f_row(int r, string k, string v) =>
-        table.cell(tbl, 0, r, k, text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
-        table.cell(tbl, 1, r, v, text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
     f_row(0, "Mode", dirMode)
     f_row(1, "Squeeze releases", str.tostring(nFired))
     f_row(2, "Valid windows opened", str.tostring(nWindow))
