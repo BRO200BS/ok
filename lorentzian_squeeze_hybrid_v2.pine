@@ -1,35 +1,17 @@
 //@version=6
-// Lorentzian × Squeeze Momentum Hybrid  —  v2 (hardened)
+// Lorentzian × Squeeze Momentum Hybrid  —  v2.1 (Final Compile-Ready)
 // ─────────────────────────────────────────────────────────────────────────────
 // Attribution: Squeeze Momentum (LazyBear), Lorentzian Classification (jdehorty, MPL-2.0)
 // This source code is subject to the terms of the Mozilla Public License 2.0
 // at https://mozilla.org/MPL/2.0/
-//
-// What changed vs v1
-//   • Realistic fills: next-bar-open execution, slippage, explicit margin/pyramiding,
-//     brackets anchored to the REAL fill price (not the signal close).
-//   • k-NN: circular buffer (no array.shift), top-k insertion (no sort), stable stride
-//     phase, 1500-bar default memory, triple-barrier labels (ATR barriers + timeout),
-//     drift-adjusted vote, squeeze-aware features, selectable distance metric.
-//   • Signal: release WINDOW + minimum squeeze duration, one trade per release,
-//     slope-aware trend filter, optional ADX/cost filters (off by default).
-//   • Risk: stop from squeeze structure (clamped by ATR), risk-% position sizing with
-//     leverage cap, partial at 1R, breakeven, chandelier trail, time stop, momentum
-//     fade exit, session/EOD flat, daily-loss and max-drawdown circuit breakers.
-//   • Validation: ablation mode (Lorentzian / Momentum-only / RANDOM direction),
-//     signal-funnel + information-coefficient table.
-//   • Alerts via alert_message JSON (alertcondition() does not work in strategies).
-//
-// NOTE: Commission / slippage / margin live in the strategy() declaration below.
-//       Set them to match your broker, then re-check the Properties tab.
 
-strategy("Lorentzian × Squeeze Hybrid v2", shorttitle="LSQ v2", overlay=false,
+strategy("Lorentzian × Squeeze Hybrid v2.1", shorttitle="LSQ v2.1", overlay=false,
      initial_capital=10000, currency=currency.USD,
      default_qty_type=strategy.percent_of_equity, default_qty_value=5,
      commission_type=strategy.commission.percent, commission_value=0.05,
      slippage=2, pyramiding=0, margin_long=100, margin_short=100,
      process_orders_on_close=false, calc_on_every_tick=false,
-     max_bars_back=100)
+     use_bar_magnifier=true, max_bars_back=5000)
 
 // ═══════════════════════════════ INPUTS ═══════════════════════════════
 string G_GEN = "General"
@@ -100,10 +82,10 @@ maxDDPct    = input.float(30.0, "Max drawdown % (halts strategy)", minval=1, ste
 
 showTable   = input.bool(true, "Show diagnostics table", group=G_DBG)
 
-// Alert payloads (strategy alerts: create alert → "Order fills only")
-const string AL_LONG  = '{"action":"buy","ticker":"{{ticker}}","price":"{{close}}","comment":"LSQ long"}'
-const string AL_SHORT = '{"action":"sell","ticker":"{{ticker}}","price":"{{close}}","comment":"LSQ short"}'
-const string AL_EXIT  = '{"action":"exit","ticker":"{{ticker}}","price":"{{close}}","comment":"LSQ exit"}'
+// Dynamic Alert payloads
+string AL_LONG  = '{"action":"buy","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"comment":"LSQ long"}'
+string AL_SHORT = '{"action":"sell","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"comment":"LSQ short"}'
+string AL_EXIT  = '{"action":"exit","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"comment":"LSQ exit"}'
 
 // ═════════════ LAYER 1 — SQUEEZE MOMENTUM ═════════════
 bbBasis = ta.sma(close, bbLength)
@@ -147,17 +129,16 @@ atrS   = ta.atr(atrLen)
 [_, _, adxVal] = ta.dmi(14, 14)
 
 // ═════════════ LAYER 2 — LORENTZIAN k-NN ═════════════
-// Six features, all scaled to [0,1]. Squeeze-aware; redundant oscillators removed.
 float f1 = ta.rsi(close, 14) / 100
-float f2 = ta.percentrank(val / atrS, normLen) / 100                     // momentum / volatility
-float f3 = ta.percentrank((bbUpper - bbLower) / bbBasis, normLen) / 100  // BB width percentile
-float f4 = math.min(lastSqzLen, 30) / 30.0                               // squeeze duration
-float f5 = ta.percentrank(adxVal, normLen) / 100                         // trend strength
-float f6 = ta.percentrank((close - ema200) / atrS, normLen) / 100        // distance to trend
+float f2 = ta.percentrank(val / atrS, normLen) / 100                     
+float f3 = ta.percentrank((bbUpper - bbLower) / bbBasis, normLen) / 100  
+float f4 = math.min(lastSqzLen, 30) / 30.0                               
+float f5 = ta.percentrank(adxVal, normLen) / 100                         
+float f6 = ta.percentrank((close - ema200) / atrS, normLen) / 100        
 const int NF = 6
 array<float> cur = array.from(f1, f2, f3, f4, f5, f6)
 
-int N = lookback + horizon + 10                      // circular buffer length
+int N = lookback + horizon + 10                      
 var matrix<float> feat   = matrix.new<float>(N, NF, na)
 var array<float>  labels = array.new<float>(N, na)
 var array<float>  knnD   = array.new<float>(kNeighbors, 1e10)
@@ -166,17 +147,15 @@ var array<float>  knnY   = array.new<float>(kNeighbors, 0.0)
 f_dist(array<float> a, matrix<float> m, int row, string mode) =>
     float s = 0.0
     for c = 0 to NF - 1
-        float d = math.abs(array.get(a, c) - matrix.get(m, row, c))   // na propagates → row skipped
+        float d = math.abs(array.get(a, c) - matrix.get(m, row, c))   
         s += mode == "Lorentzian" ? math.log(1 + d) : mode == "Manhattan" ? d : d * d
     s
 
-// 1) write this bar's features into its slot (label unknown yet)
 int slot = bar_index % N
 for c = 0 to NF - 1
     matrix.set(feat, slot, c, array.get(cur, c))
 array.set(labels, slot, na)
 
-// 2) triple-barrier label for the row `horizon` bars ago (all of its future bars are now closed)
 if bar_index >= horizon
     float e0 = close[horizon]
     float a0 = atrS[horizon]
@@ -199,7 +178,6 @@ if bar_index >= horizon
                 break
     array.set(labels, (bar_index - horizon) % N, lab)
 
-// 3) k-NN search over stable stride-aligned rows, keeping the k best via insertion
 float prediction = na
 int poolN = 0
 if bar_index > horizon + 1
@@ -246,6 +224,35 @@ bool dirShort = switch dirMode
     "Momentum Only" => momNeg and momDown and trendShort
     => not randLong
 
+// ═════════════ CIRCUIT BREAKERS (Native Pine v6 Implementation) ═════════════
+var float dayStartEquity = na
+var float peakEquity = strategy.equity
+var bool dailyLossHit = false
+var bool maxDDHit = false
+
+// Reset daily loss tracker on new day
+if dayofmonth != dayofmonth[1] or na(dayStartEquity)
+    dayStartEquity := strategy.equity
+    dailyLossHit := false
+
+// Track peak equity for drawdown
+if strategy.equity > peakEquity
+    peakEquity := strategy.equity
+
+// Daily Loss Check
+if useDailyLoss and not dailyLossHit
+    if strategy.equity < dayStartEquity * (1 - dailyLossPct / 100)
+        dailyLossHit := true
+        strategy.close_all(comment="Daily Loss Limit")
+
+// Max Drawdown Check
+if useMaxDD and not maxDDHit
+    if peakEquity > 0 and (peakEquity - strategy.equity) / peakEquity > (maxDDPct / 100)
+        maxDDHit := true
+        strategy.close_all(comment="Max DD Limit")
+
+bool circuitBreakerTripped = dailyLossHit or maxDDHit
+
 // ═════════════ LAYER 5 — STOP, SIZING, ENTRIES ═════════════
 float structL = close - ta.lowest(low, structLen)
 float structS = ta.highest(high, structLen) - close
@@ -262,7 +269,8 @@ var bool usedRelease = false
 if squeezeFired
     usedRelease := false
 
-bool baseOk = inDate and inSess and inWindow and not usedRelease and (not useAdxFilter or adxVal > adxMin)
+// Inject circuit breaker into baseOk
+bool baseOk = inDate and inSess and inWindow and not usedRelease and not circuitBreakerTripped and (not useAdxFilter or adxVal > adxMin)
 bool costOkL = not useCostFilter or longStopD / close * 100 >= estCostPct * costMult
 bool costOkS = not useCostFilter or shortStopD / close * 100 >= estCostPct * costMult
 
@@ -275,14 +283,8 @@ f_qty(float stopD) =>
     q := math.floor(q / syminfo.mincontract) * syminfo.mincontract
     q
 
-// Circuit breakers
-if useDailyLoss
-    strategy.risk.max_intraday_loss(dailyLossPct, strategy.percent_of_equity)
-if useMaxDD
-    strategy.risk.max_drawdown(maxDDPct, strategy.percent_of_equity)
-
-var float pendStop = na   // stop distance of the order currently being sent
-var float stopDist = na   // stop distance of the open trade
+var float pendStop = na   
+var float stopDist = na   
 var float stopPx   = na
 var float tpPx     = na
 var int   barsInTrade = 0
@@ -304,8 +306,6 @@ if canLong
     if q > 0
         pendStop := longStopD
         strategy.entry("Long", strategy.long, qty=q, alert_message=AL_LONG)
-        float tk = longStopD / syminfo.mintick
-        strategy.exit("Long X", from_entry="Long", loss=tk, profit=tk * rrRatio, alert_message=AL_EXIT)
         usedRelease := true
         nSent += 1
     else
@@ -316,8 +316,6 @@ if canShort
     if q > 0
         pendStop := shortStopD
         strategy.entry("Short", strategy.short, qty=q, alert_message=AL_SHORT)
-        float tk = shortStopD / syminfo.mintick
-        strategy.exit("Short X", from_entry="Short", loss=tk, profit=tk * rrRatio, alert_message=AL_EXIT)
         usedRelease := true
         nSent += 1
     else
@@ -350,6 +348,7 @@ if inPos and not na(stopDist)
     if usePartial and not partialDone and fav >= partialR * stopDist
         partialDone := true
         strategy.close(idE, qty_percent=partialPct, comment="Partial")
+    
     strategy.exit(idE + " X", from_entry=idE, stop=stopPx, limit=tpPx, alert_message=AL_EXIT)
 
     if maxBarsHold > 0 and barsInTrade >= maxBarsHold
@@ -362,7 +361,7 @@ if useSession and eodFlat and not inSess and inPos
 
 // ═════════════ DIAGNOSTICS ═════════════
 float fwdRet = close / close[horizon] - 1
-float ic = ta.correlation(nz(prediction[horizon]), fwdRet, 500)
+float ic = ta.correlation(prediction[horizon], fwdRet, 500)
 
 var table tbl = table.new(position.top_right, 2, 9, border_width=1)
 if showTable and barstate.islast
